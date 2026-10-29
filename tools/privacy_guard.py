@@ -114,7 +114,10 @@ def project_root(value):
         fail("INVALID_PROJECT")
     if path.drive.startswith("\\\\"):
         fail("INVALID_PROJECT")
-    _no_links(path)
+    try:
+        _no_links(path)
+    except OSError:
+        fail("INVALID_PROJECT")
     if not path.is_dir():
         fail("INVALID_PROJECT")
     return path
@@ -247,7 +250,12 @@ def validate_policy(policy):
 
 def load_policy(root):
     root = project_root(root)
-    location = _no_links(root / POLICY_PATH)
+    try:
+        location = _no_links(root / POLICY_PATH)
+    except FileNotFoundError:
+        fail("POLICY_MISSING")
+    except NotADirectoryError:
+        fail("INVALID_POLICY")
     if not location.is_file() or location.stat().st_nlink != 1:
         fail("INVALID_POLICY")
     with location.open("rb") as stream:
@@ -414,22 +422,78 @@ def _bools(arguments, names):
             fail("INVALID_ARGUMENTS")
 
 
-def tool_decision(payload):
-    _keys(payload, ("toolName", "toolArgs", "cwd"))
-    root = project_root(_text(payload["cwd"]))
-    policy = load_policy(root)
-    name = _text(payload["toolName"])
-    known = {"ask_user", "view", "edit", "create", "rg", "grep", "glob", "session_store_sql", "powershell"}
-    if name.startswith("functions.") and name[10:] in known:
-        name = name[10:]
-    if name not in known:
-        fail("TOOL_DENIED")
-    arguments = payload["toolArgs"]
-    if isinstance(arguments, str):
-        arguments = parse_json(arguments)
-    if not isinstance(arguments, dict):
+def form_choices(values, *, labeled=False):
+    if not isinstance(values, list):
         fail("INVALID_ARGUMENTS")
-    if name == "ask_user":
+    for value in values:
+        if labeled:
+            _keys(value, ("const", "title"))
+            _text(value["const"], nonempty=False)
+            _text(value["title"], nonempty=False)
+        else:
+            _text(value, nonempty=False)
+
+
+def form_field(field):
+    _keys(field, ("type",), ("title", "description", "default", "enum", "enumNames", "oneOf", "items"))
+    kind = field["type"]
+    if not isinstance(kind, str) or kind not in ("string", "boolean", "number", "integer", "array"):
+        fail("INVALID_ARGUMENTS")
+    for key in ("title", "description"):
+        if key in field:
+            _text(field[key], nonempty=False)
+    if kind == "string":
+        if "items" in field or ("enum" in field and "oneOf" in field):
+            fail("INVALID_ARGUMENTS")
+        if "enum" in field:
+            form_choices(field["enum"])
+        if "enumNames" in field:
+            form_choices(field["enumNames"])
+            if "enum" not in field or len(field["enumNames"]) != len(field["enum"]):
+                fail("INVALID_ARGUMENTS")
+        if "oneOf" in field:
+            form_choices(field["oneOf"], labeled=True)
+        if "default" in field:
+            _text(field["default"], nonempty=False)
+    else:
+        if any(key in field for key in ("enum", "enumNames", "oneOf")):
+            fail("INVALID_ARGUMENTS")
+        if kind == "array":
+            items = field.get("items")
+            if not isinstance(items, dict):
+                fail("INVALID_ARGUMENTS")
+            if "anyOf" in items:
+                _keys(items, ("anyOf",))
+                form_choices(items["anyOf"], labeled=True)
+            else:
+                _keys(items, ("type", "enum"))
+                if items["type"] != "string":
+                    fail("INVALID_ARGUMENTS")
+                form_choices(items["enum"])
+            if "default" in field:
+                form_choices(field["default"])
+        else:
+            if "items" in field:
+                fail("INVALID_ARGUMENTS")
+            if "default" in field and (
+                (kind == "boolean" and type(field["default"]) is not bool)
+                or (kind in ("number", "integer") and type(field["default"]) not in (int, float))
+            ):
+                fail("INVALID_ARGUMENTS")
+
+
+def ask_user_arguments(arguments):
+    if "message" in arguments or "requestedSchema" in arguments:
+        _keys(arguments, ("message", "requestedSchema"))
+        _text(arguments["message"])
+        schema = arguments["requestedSchema"]
+        _keys(schema, ("properties",))
+        if not isinstance(schema["properties"], dict):
+            fail("INVALID_ARGUMENTS")
+        for name, field in schema["properties"].items():
+            _text(name, nonempty=False)
+            form_field(field)
+    else:
         _keys(arguments, ("question",), ("choices", "allow_freeform"))
         _text(arguments["question"])
         if "choices" in arguments:
@@ -438,6 +502,84 @@ def tool_decision(payload):
             for choice in arguments["choices"]:
                 _text(choice)
         _bools(arguments, ("allow_freeform",))
+
+
+def patch_arguments(root, policy, patch):
+    def target(value, *, allow_missing=False):
+        if value != value.strip():
+            fail("INVALID_PATH")
+        approved_file(root, policy, value, allow_missing=allow_missing)
+
+    patch = _text(patch).replace("\r\n", "\n")
+    # Avoid alternate line splitting that could hide a file header from checks.
+    if any(char in patch for char in "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"):
+        fail("INVALID_ARGUMENTS")
+    lines = patch.removesuffix("\n").split("\n")
+    if len(lines) < 3 or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        fail("INVALID_ARGUMENTS")
+    index = 1
+    while index < len(lines) - 1:
+        header = lines[index]
+        operation = next(
+            (kind for kind in ("Add", "Delete", "Update") if header.startswith(f"*** {kind} File: ")),
+            None,
+        )
+        if operation is None:
+            fail("INVALID_ARGUMENTS")
+        path = header[len(f"*** {operation} File: "):]
+        target(path, allow_missing=operation == "Add")
+        index += 1
+        if operation == "Update" and lines[index].startswith("*** Move to: "):
+            target(lines[index][len("*** Move to: "):], allow_missing=True)
+            index += 1
+        start = index
+        while index < len(lines) - 1:
+            line = lines[index]
+            if line.startswith(("*** Add File: ", "*** Delete File: ", "*** Update File: ")):
+                break
+            if operation == "Add":
+                if not line.startswith("+"):
+                    fail("INVALID_ARGUMENTS")
+            elif operation == "Update":
+                if line == "*** End of File":
+                    index += 1
+                    break
+                if not (line.startswith((" ", "+", "-", "@@ ")) or line == "@@"):
+                    fail("INVALID_ARGUMENTS")
+            else:
+                fail("INVALID_ARGUMENTS")
+            index += 1
+        if operation == "Add" and index == start:
+            fail("INVALID_ARGUMENTS")
+
+
+def tool_decision(payload):
+    _keys(payload, ("toolName", "toolArgs", "cwd"), ("sessionId", "timestamp"))
+    if "sessionId" in payload:
+        _text(payload["sessionId"])
+    if "timestamp" in payload and type(payload["timestamp"]) not in (int, float):
+        fail("INVALID_FIELDS")
+    root = project_root(_text(payload["cwd"]))
+    policy = load_policy(root)
+    name = _text(payload["toolName"])
+    known = {"ask_user", "view", "edit", "create", "apply_patch", "rg", "grep", "glob", "session_store_sql", "powershell"}
+    if name.startswith("functions.") and name[10:] in known:
+        name = name[10:]
+    if name not in known:
+        fail("TOOL_DENIED")
+    arguments = payload["toolArgs"]
+    if name == "apply_patch":
+        # Freeform tools arrive as raw text or a JSON-encoded string.
+        if isinstance(arguments, str) and arguments.lstrip().startswith('"'):
+            arguments = parse_json(arguments)
+        patch_arguments(root, policy, arguments)
+        return {}
+    if isinstance(arguments, str):
+        arguments = parse_json(arguments)
+    if not isinstance(arguments, dict):
+        fail("INVALID_ARGUMENTS")
+    if name == "ask_user":
+        ask_user_arguments(arguments)
     elif name == "view":
         _keys(arguments, ("path",), ("view_range", "forceReadLargeFiles"))
         value = _text(arguments["path"]).replace("/", "\\")

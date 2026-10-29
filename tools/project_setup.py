@@ -50,10 +50,25 @@ review, using --project PATH --path ABSOLUTE_FILE --category source|synthetic
 --reviewed. External reads, searches and edits require matching SHA-256 digests;
 changed external files need reapproval. Never approve business values or secrets.
 The policy root is the exact absolute hook cwd; no parent-directory lookup.
+POLICY_MISSING means this directory is uninitialized or the CLI is in the wrong
+directory. Start a fresh session from the exact initialized project root;
+otherwise have a human run setup init for the intended root. INVALID_PROJECT
+means the supplied root is not an existing supported absolute directory.
 Hooks cannot control prompts, attachments, automatic context, or other clients.
 Project directory listings, glob discovery and directory searches are allowed;
 filesystem aliases, special files and external directory scopes remain blocked.
+Use view, glob and rg/grep for files and searches, not shell equivalents.
+Use edit/create or apply_patch for ordinary source changes. apply_patch checks
+all sources and move destinations; control paths remain protected.
+ask_user accepts message/requestedSchema forms and legacy question/choices.
 git --no-pager status --short is allowed; other shell commands need review.
+For builds/tests, use only a human-reviewed task already declared in policy:
+python -I '<installed-plugin-root>\\tools\\privacy_guard.py' run --task <task-name>
+Use the installed plugin's actual absolute path, synchronously and attached,
+with no extra commands, pipes, options or shellId. Do not approve tasks yourself.
+If a needed task is unavailable, report the block and request human review.
+Do not invoke MCP, delegation, skills, operational SQL or shell follow-up tools
+under this baseline. Tool declarations do not grant these capabilities.
 For session_store_sql use source=local and the exact current project cwd:
 SELECT id, summary, updated_at FROM sessions WHERE cwd='<project-root>'
 ORDER BY updated_at DESC LIMIT 20
@@ -257,11 +272,13 @@ def preflight(project, plugin_root=None):
     if not validate_project(project):
         return report(["PROJECT_INVALID"], 0)
     target = project / POLICY_DIRECTORY
-    if target.exists() and unsafe_path(target):
+    if target.is_symlink() or (target.exists() and (unsafe_path(target) or not target.is_dir())):
         return report(["PROJECT_CONFIG_INVALID"], 0)
     policy = target / "policy.json"
-    if not policy.is_file() or policy.is_symlink():
-        codes.append("POLICY_MISSING_OR_INVALID")
+    if policy.is_symlink() or (policy.exists() and not policy.is_file()):
+        codes.append("POLICY_INVALID_OR_DRIFT")
+    elif not policy.exists():
+        codes.append("POLICY_MISSING")
     else:
         try:
             if unsafe_path(policy):
@@ -294,13 +311,23 @@ def preflight(project, plugin_root=None):
 
 
 def report(codes, count, failed=True):
-    print(json.dumps({
+    guidance = {
+        "PROJECT_INVALID": "Use the exact existing absolute project root, not a relative path or filesystem alias.",
+        "POLICY_MISSING": "No policy at the supplied root. Start the CLI from the exact initialized project root, or have a human initialize the intended root. Parent policies are not inherited.",
+        "PROJECT_CONFIG_INVALID": "Have a human review the project configuration directory; it must be an ordinary directory.",
+        "POLICY_INVALID_OR_DRIFT": "Have a human review the existing policy and external-file approvals; do not overwrite or broaden policy.",
+    }
+    result = {
         "codes": sorted(set(codes)),
         "count": count,
         "cli_runtime": "UNVERIFIED",
         "client_version": "UNVERIFIED",
         "vscode": "ADVISORY_NOT_TOOL_ENFORCED",
-    }, separators=(",", ":")))
+    }
+    messages = [guidance[code] for code in sorted(set(codes)) if code in guidance]
+    if messages:
+        result["guidance"] = messages
+    print(json.dumps(result, separators=(",", ":")))
     return 1 if failed else 0
 
 

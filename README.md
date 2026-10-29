@@ -164,11 +164,34 @@ denied if its entire possible input tree contains one of these, or exceeds
 Policy, hook, and plugin implementation files are not ordinary editable targets.
 The assistant must not approve its own changes or broaden the policy.
 
+Native `apply_patch` calls accept raw patch text or a JSON-encoded patch string.
+Add, update, delete, and move operations check every source and destination
+against the same file rules as `edit` and `create`; protected paths remain
+blocked and external files still require current individual approvals. Checks
+use the filesystem state before the patch runs, and new files require an
+existing parent directory. The hook also accepts current `ask_user` forms
+(`message` and `requestedSchema`) alongside legacy question/choices arguments.
+
 Start a fresh CLI session from the exact target project root. Confirm the
 plugin is enabled and its hooks are loaded using the client's plugin and
 environment views. A successful installation or static preflight does not prove
 the runtime hook is active. First exercise approved and denied operations using
 synthetic files only. Do not use allow-all modes or disable hooks.
+
+Denials preserve allowlisted fixed codes such as `TOOL_DENIED`,
+`INVALID_ARGUMENTS`, `CONTROL_PATH`, and `SEARCH_SCOPE_LIMIT`. Arguments,
+paths, file contents, and raw engine diagnostics are never included in the
+launcher response. Unknown reasons remain `CLI_POLICY_DENIED`; launcher failures
+remain `CLI_GUARD_FAILURE`.
+
+`POLICY_MISSING` includes fixed setup guidance: the current directory is either
+uninitialized or is not the initialized project root. Start a fresh session
+from the exact initialized root; otherwise have a human initialize the intended
+root. The hook deliberately does not search parent policies and cannot infer
+which root you intended. `INVALID_PROJECT` identifies an invalid working
+directory, such as a relative or nonexistent root. Preflight also reports
+`POLICY_MISSING` separately from invalid policy and provides fixed guidance
+without echoing the supplied path.
 
 Update the installed GitHub plugin after reviewing upstream changes, update
 the setup checkout to the corresponding revision, and start a fresh session:
@@ -190,6 +213,8 @@ copilot --plugin-dir "$ToolkitRoot"
 roles and other agents, including the default fallback when a data query is
 blocked: respect the denial, do not bypass it, and offer only an explicitly
 unexecuted read-only SQL/DAX template using permitted schema knowledge.
+It directs agents to supported file/search/edit tools and existing
+human-reviewed build/test tasks, not shell equivalents or unapproved commands.
 
 For **new and existing target projects**, run this from a human terminal after
 setting `$ToolkitRoot` and `$ProjectRoot` as above:
@@ -204,6 +229,10 @@ If the marked guidance was modified or comes from an older version, the command
 requests human review rather than overwriting it. Review and commit the file,
 then start a fresh agent session. `init` remains unchanged and does not install
 instructions implicitly.
+
+Plugin updates do not overwrite existing project guidance or policy. Older
+`AGENTS.md` sections and generated `guidance.txt` require human review; retain
+existing policy approvals rather than rerunning initialization over them.
 
 Root `AGENTS.md` is the project-wide default for clients/agents that load it;
 installing the plugin alone does not install these instructions into a target

@@ -90,8 +90,8 @@ class PrivacyGuardTests(unittest.TestCase):
     def test_unknown_capabilities_and_prefix_spoofing_denied(self):
         for name in (
             "mcp.read", "web_fetch", "web_search", "get_diagnostics",
-            "task", "skill", "sql", "browser", "bash", "apply_patch",
-            "functions.apply_patch", "functions.mcp.read", "functions.functions.view",
+            "task", "skill", "sql", "browser", "bash",
+            "functions.mcp.read", "functions.functions.view", "functions.functions.apply_patch",
             "future_tool", "get_file_contents",
         ):
             with self.subTest(name=name):
@@ -104,6 +104,162 @@ class PrivacyGuardTests(unittest.TestCase):
             "agent_type": "fabric-project-toolkit:quality-engineer",
             "prompt": "Run synthetic tests",
         })
+
+    def test_current_ask_user_forms_and_legacy_arguments(self):
+        arguments = {
+            "message": "Review synthetic changes?",
+            "requestedSchema": {"properties": {
+                "notes": {"type": "string", "title": "Notes", "description": "", "default": ""},
+                "choice": {"type": "string", "enum": ["keep", "edit"], "enumNames": ["Keep", "Edit"]},
+                "labeled": {"type": "string", "oneOf": [{"const": "keep", "title": "Keep"}], "default": "keep"},
+                "confirm": {"type": "boolean", "default": False},
+                "amount": {"type": "number", "default": 1.5},
+                "count": {"type": "integer", "default": 2},
+                "tags": {"type": "array", "items": {"type": "string", "enum": ["source"]}, "default": ["source"]},
+                "labels": {"type": "array", "items": {"anyOf": [{"const": "source", "title": "Source"}]}},
+            }},
+        }
+        for name in ("ask_user", "functions.ask_user"):
+            for payload in (arguments, json.dumps(arguments)):
+                self.assertEqual(self.decision(name, payload), {})
+            self.assertEqual(self.decision(name, {
+                "question": "Review?", "choices": ["Keep", "Edit"], "allow_freeform": True,
+            }), {})
+
+    def test_current_ask_user_rejects_malformed_and_mixed_schemas(self):
+        for arguments in (
+            {"message": "Review?"},
+            {"message": "Review?", "requestedSchema": {"properties": []}},
+            {"message": "Review?", "requestedSchema": {"properties": {}}, "question": "Legacy?"},
+            {"message": "Review?", "requestedSchema": {"properties": {}, "$ref": "external"}},
+        ):
+            self.denied("ask_user", arguments)
+        for field in (
+            None, {"type": "object"}, {"type": []}, {"type": "string", "extra": True},
+            {"type": "string", "enum": "keep"}, {"type": "string", "enum": [1]},
+            {"type": "string", "enum": ["keep"], "enumNames": []},
+            {"type": "string", "enum": ["keep"], "oneOf": []},
+            {"type": "string", "oneOf": [{"const": "keep"}]},
+            {"type": "string", "default": False},
+            {"type": "boolean", "default": "true"}, {"type": "number", "default": True},
+            {"type": "integer", "items": {}}, {"type": "array"},
+            {"type": "array", "items": {"type": "number", "enum": [1]}},
+            {"type": "array", "items": {"anyOf": [], "enum": []}},
+            {"type": "array", "items": {"anyOf": []}, "default": "source"},
+        ):
+            with self.subTest(field=field):
+                self.denied("ask_user", {
+                    "message": "Review?", "requestedSchema": {"properties": {"choice": field}},
+                })
+
+    def test_apply_patch_validates_all_operations_and_freeform_encodings(self):
+        (self.root / "obsolete.py").write_text("obsolete = True\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Add File: new.py\n+answer = 43\n"
+            "*** Update File: sample.py\n*** Move to: renamed.py\n"
+            "@@ answer\n-answer = 42\n+answer = 43\n*** End of File\n"
+            "*** Delete File: obsolete.py\n"
+            "*** End Patch\n"
+        )
+        for name in ("apply_patch", "functions.apply_patch"):
+            for arguments in (patch, json.dumps(patch), patch.replace("\n", "\r\n")):
+                self.assertEqual(self.decision(name, arguments), {})
+        self.assertEqual(self.file.read_text(encoding="utf-8"), "answer = 42\n")
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertEqual(self.decision("apply_patch", (
+            f"*** Begin Patch\n*** Update File: {self.file}\n"
+            "@@\n answer = 42\n+extra = 1\n*** End Patch"
+        )), {})
+
+    def test_apply_patch_rejects_malformed_grammar_without_leaking_input(self):
+        for patch in (
+            {}, {"input": "*** Begin Patch\n*** Delete File: sample.py\n*** End Patch"},
+            "", "*** Begin Patch\n*** End Patch\n",
+            "*** Begin Patch\n*** Add File: new.py\n*** End Patch\n",
+            "*** Begin Patch\n*** Delete File: sample.py\n+unexpected\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: sample.py\nunmarked\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: sample.py\n*** Move to: renamed.py\n"
+            "*** Move to: other.py\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: sample.py\n*** End of File\n+trailing\n*** End Patch\n",
+            "*** Begin Patch\n*** Delete File: sample.py\n*** End Patch\ntrailing",
+            "*** Begin Patch\n*** Delete File: sample.py\n*** End Patch\n\n",
+            "*** Begin Patch\n*** Delete File: sample.py\u2028\n*** End Patch",
+            f"*** Begin Patch\n*** Execute: {SYNTHETIC}\n*** End Patch",
+        ):
+            with self.subTest(patch=patch):
+                result = self.denied("apply_patch", patch)
+                self.assertNotIn(SYNTHETIC, json.dumps(result))
+
+    def test_apply_patch_protects_every_source_and_move_destination(self):
+        for path in (
+            "..\\outside.py", ".copilot-privacy\\policy.json", ".github\\settings.json",
+            "AGENTS.md", "hooks.json", "tools\\privacy_guard.py", "sample.py.",
+            "sample.py:stream", " sample.py", "sample.py ", "missing\\new.py",
+            str(ROOT / "PROJECT-GOALS.md"),
+        ):
+            for operation in ("Add", "Update", "Delete", "Move"):
+                with self.subTest(path=path, operation=operation):
+                    body = (
+                        f"*** Update File: sample.py\n*** Move to: {path}\n"
+                        if operation == "Move" else f"*** {operation} File: {path}\n"
+                    )
+                    if operation == "Add":
+                        body += "+synthetic\n"
+                    self.denied("apply_patch", "*** Begin Patch\n" + body + "*** End Patch\n")
+        self.denied("apply_patch", (
+            "*** Begin Patch\n*** Add File: ordinary.py\n+synthetic\n"
+            "*** Add File: AGENTS.md\n+protected\n*** End Patch\n"
+        ))
+        self.assertFalse((self.root / "ordinary.py").exists())
+        alias = self.root / "hardlink.py"
+        os.link(self.file, alias)
+        self.denied("apply_patch", "*** Begin Patch\n*** Delete File: hardlink.py\n*** End Patch")
+        alias.unlink()
+        actual = Path.lstat
+
+        def reparse(path):
+            info = actual(path)
+            if path == self.file:
+                return mock.Mock(st_mode=info.st_mode, st_file_attributes=0x400)
+            return info
+
+        with mock.patch.object(Path, "lstat", reparse):
+            self.denied("apply_patch", "*** Begin Patch\n*** Update File: sample.py\n*** End Patch")
+            self.denied("apply_patch", (
+                "*** Begin Patch\n*** Add File: sample.py\n+synthetic\n*** End Patch"
+            ))
+        with mock.patch.object(guard, "PLUGIN_ROOT", self.root):
+            self.denied("apply_patch", "*** Begin Patch\n*** Delete File: sample.py\n*** End Patch")
+
+    def test_apply_patch_external_targets_require_current_individual_approvals(self):
+        project = self.root / "consumer"
+        (project / ".copilot-privacy").mkdir(parents=True)
+        (project / guard.POLICY_PATH).write_text(json.dumps(guard.empty_policy()), encoding="utf-8")
+        local = project / "local.py"
+        local.write_text("answer = 42\n", encoding="utf-8")
+        patches = (
+            f"*** Begin Patch\n*** Update File: {self.file}\n@@\n-answer = 42\n+answer = 43\n*** End Patch",
+            f"*** Begin Patch\n*** Delete File: {self.file}\n*** End Patch",
+            f"*** Begin Patch\n*** Add File: {self.file}\n+answer = 43\n*** End Patch",
+            f"*** Begin Patch\n*** Update File: local.py\n*** Move to: {self.file}\n*** End Patch",
+            f"*** Begin Patch\n*** Update File: {self.file}\n*** Move to: moved.py\n*** End Patch",
+        )
+        for patch in patches:
+            self.denied("apply_patch", patch, cwd=str(project))
+        guard.approve(project, str(self.file), "source", reviewed=True)
+        for patch in patches:
+            self.assertEqual(self.decision("apply_patch", patch, cwd=str(project)), {})
+        self.file.write_text("answer = 43\n", encoding="utf-8")
+        for patch in patches:
+            self.assertEqual(
+                self.denied("apply_patch", patch, cwd=str(project))["permissionDecisionReason"],
+                "STALE_DIGEST",
+            )
+        missing = self.root / "unapproved.py"
+        self.denied("apply_patch", (
+            f"*** Begin Patch\n*** Update File: local.py\n*** Move to: {missing}\n*** End Patch"
+        ), cwd=str(project))
 
     def test_malformed_payloads_bom_encoding_and_no_input_leaks(self):
         for raw in (
@@ -121,6 +277,26 @@ class PrivacyGuardTests(unittest.TestCase):
         self.assertEqual(guard.hook(b"\xef\xbb\xbf" + json.dumps(payload).encode()), {})
         payload["unknown"] = SYNTHETIC
         self.assertEqual(guard.hook(json.dumps(payload))["permissionDecision"], "deny")
+
+    def test_native_hook_metadata_preserves_tool_argument_validation(self):
+        for name, arguments in (
+            ("view", {"path": "sample.py"}),
+            ("functions.edit", {"path": "sample.py", "old_str": "42", "new_str": "43"}),
+            ("ask_user", {"message": "Review?", "requestedSchema": {"properties": {}}}),
+        ):
+            self.assertEqual(self.decision(
+                name, arguments, sessionId="synthetic-session", timestamp=1793289600000,
+            ), {})
+        for metadata in (
+            {"sessionId": []}, {"sessionId": ""}, {"timestamp": True},
+            {"timestamp": "2026-10-29"}, {"unknown": "synthetic"},
+        ):
+            self.denied("view", {"path": "sample.py"}, **metadata)
+        self.assertEqual(
+            self.denied("view", {"path": "sample.py", "view_range": [0, -1]},
+                        sessionId="synthetic-session", timestamp=1)["permissionDecisionReason"],
+            "INVALID_ARGUMENTS",
+        )
 
     def test_project_reads_and_explicit_file_searches(self):
         self.classify()
@@ -402,8 +578,31 @@ class PrivacyGuardTests(unittest.TestCase):
     def test_no_parent_policy_discovery_and_invalid_root(self):
         child = self.root / "child"
         child.mkdir()
-        self.denied("ask_user", {"question": "Review?"}, cwd=str(child))
-        self.denied("ask_user", {"question": "Review?"}, cwd=".")
+        original = (self.root / guard.POLICY_PATH).read_bytes()
+        self.assertEqual(
+            self.denied("ask_user", {"question": "Review?"}, cwd=str(child))["permissionDecisionReason"],
+            "POLICY_MISSING",
+        )
+        for cwd in (".", str(self.root / "missing"), str(self.file)):
+            self.assertEqual(
+                self.denied("ask_user", {"question": "Review?"}, cwd=cwd)["permissionDecisionReason"],
+                "INVALID_PROJECT",
+            )
+        self.assertFalse((child / guard.POLICY_PATH).exists())
+        self.assertEqual(original, (self.root / guard.POLICY_PATH).read_bytes())
+
+    def test_missing_policy_is_distinct_from_invalid_policy(self):
+        location = self.root / guard.POLICY_PATH
+        location.unlink()
+        self.assertEqual(
+            self.denied("view", {"path": "sample.py"})["permissionDecisionReason"],
+            "POLICY_MISSING",
+        )
+        location.mkdir()
+        self.assertEqual(
+            self.denied("view", {"path": "sample.py"})["permissionDecisionReason"],
+            "INVALID_POLICY",
+        )
 
     def test_human_attestation_required_atomic_update_and_no_contents(self):
         original = (self.root / guard.POLICY_PATH).read_bytes()

@@ -57,8 +57,8 @@ project, approved external files, prompts, and retrieved history.
 | Edit `AGENTS.md`, `copilot-instructions.md`, `plugin.json`, `hooks.json`, or `privacy_guard.py` | Blocked | Protected file names apply at any depth, case-insensitively. |
 | Edit the installed plugin package | Blocked | Plugin implementation is not an ordinary editable target. |
 | Have the agent approve its own files or widen policy | Blocked | No ordinary agent approval command or policy-edit grant. |
-| Delete, rename, or move files through a general-purpose tool | Blocked | No such tool is allowlisted; `edit` does not accept a move argument. Reviewed tasks can have separate side effects. |
-| Use `apply_patch`, including for otherwise trusted source files | Blocked | This baseline allows `edit`/`create`, not arbitrary patch payloads. |
+| Delete, rename, or move ordinary files using `apply_patch` | Conditional | Every source and move destination must pass the same file checks; protected paths remain blocked. `edit` still does not accept a move argument. |
+| Use `apply_patch` for source changes | Conditional | Raw or JSON-encoded patch text, validated add/update/delete/move headers, and existing parent directories. External targets need current individual approvals. |
 
 ## External files and filesystem boundaries
 
@@ -179,7 +179,10 @@ python -I '<installed-plugin-root>\tools\privacy_guard.py' run --task <reviewed-
 | Initialize a new project from a human terminal | Allowed | Creates project-local policy and advisory configuration; does not install plugins or change personal authentication/settings. |
 | Initialize over an existing `.copilot-privacy` directory | Blocked | Non-destructive collision check; existing policy is not overwritten. |
 | Use an existing valid policy after upgrading to root trust | Allowed | Internal digest entries no longer gate access. |
-| Run protected tools without a policy at the exact current directory | Blocked | No parent-policy discovery and no automatic project opt-out. |
+| Run protected tools without a policy at the exact current directory | Blocked | `POLICY_MISSING` explains initialization and exact-root requirements. No parent-policy discovery or automatic project opt-out. |
+| Use a relative or nonexistent hook working directory | Blocked | `INVALID_PROJECT` returns fixed working-directory guidance without echoing paths. |
+| Receive a recognized policy denial | Allowed | Only allowlisted fixed reason codes and fixed guidance are exposed. Unknown reasons become `CLI_POLICY_DENIED`; engine output and arguments are not echoed. |
+| Send current native hook metadata or current `ask_user` forms | Conditional | Optional numeric `timestamp` and string `sessionId`; validated `message`/`requestedSchema` forms. Legacy question/choices remain supported. |
 | Use malformed policy, duplicate JSON keys, invalid digests, unknown fields, or invalid task entries | Blocked | Policy validation precedes tool decisions. Legacy internal entries must still be structurally valid. |
 | Send malformed, oversized, or invalidly encoded hook input | Blocked | Fixed denial output; input is not echoed. |
 | Encounter a missing engine/interpreter, engine crash, or internal wrapper deadline | Blocked | When the wrapper runs and returns within the host deadline, it returns a fixed denial. |

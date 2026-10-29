@@ -28,7 +28,10 @@ before introducing tooling or large fixture sets.
 ## Execution boundaries
 
 Use the smallest existing test/build command covering the change. Fixtures
-must be fictional and output safe metadata only. Shell access does not authorize
+must be fictional and output safe metadata only. Under the CLI baseline, run
+that command only through an existing human-reviewed policy task, not directly
+in the shell. If no task is available, report the block and request human review;
+do not approve tasks yourself. Shell access does not authorize
 live failure injection, resource resets, patient generation or deployment.
 Obtain explicit scoped approval before exercising those operations.
 

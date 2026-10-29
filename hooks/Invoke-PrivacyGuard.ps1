@@ -51,14 +51,37 @@ try {
         throw 'INVALID_OUTPUT'
     }
     $result = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
-    # Never forward engine output, raw reasons, arguments, or launcher diagnostics.
+    # Only exact allowlisted reasons may leave the launcher, never raw diagnostics.
     if ($result -is [PSCustomObject] -and @($result.PSObject.Properties).Count -eq 0) {
         $decision = '{}'
     }
     elseif ($result -isnot [System.Array] -and $result.permissionDecision -ceq 'deny') {
         $decision = '{"permissionDecision":"deny","permissionDecisionReason":"CLI_POLICY_DENIED"}'
-        if ($result.permissionDecisionReason -ceq 'HISTORY_SCOPE_REQUIRED') {
-            $decision = '{"permissionDecision":"deny","permissionDecisionReason":"CLI_HISTORY_SCOPE_REQUIRED: Use source=local. Supported SQL: SELECT id, summary, updated_at FROM sessions WHERE cwd=''<exact project root>'' ORDER BY updated_at DESC LIMIT 20; or SELECT t.session_id, t.user_message, t.assistant_response FROM turns AS t JOIN sessions AS s ON t.session_id=s.id WHERE s.cwd=''<exact project root>'' ORDER BY t.timestamp DESC LIMIT 50. Substitute the current project root and escape SQL quotes. No unscoped queries."}'
+        $safeReasons = @(
+            'DUPLICATE_KEY', 'INVALID_JSON', 'INPUT_LIMIT', 'INVALID_VALUE',
+            'INVALID_FIELDS', 'LINK_PATH', 'INVALID_PROJECT', 'INVALID_PATH',
+            'CONTROL_PATH', 'NOT_REGULAR_FILE', 'OUTSIDE_PROJECT', 'FILE_CHANGED',
+            'INVALID_VERSION', 'INVALID_POLICY', 'POLICY_MISSING', 'DUPLICATE_PATH',
+            'INVALID_CATEGORY', 'INVALID_DIGEST', 'INVALID_TASK', 'TASK_NOT_REVIEWED',
+            'STALE_DIGEST', 'UNCLASSIFIED_FILE', 'SEARCH_SCOPE_LIMIT',
+            'HISTORY_SCOPE_REQUIRED', 'TOOL_DENIED', 'INVALID_ARGUMENTS',
+            'SHELL_DENIED', 'POLICY_ERROR'
+        )
+        $reason = $result.permissionDecisionReason
+        if ($reason -is [string] -and $safeReasons -ccontains $reason) {
+            if ($reason -ceq 'POLICY_MISSING') {
+                $reason = 'POLICY_MISSING: No project policy in the current working directory. Start a fresh CLI session from the exact initialized project root, or have a human initialize the intended root. Parent policies are not inherited.'
+            }
+            elseif ($reason -ceq 'INVALID_PROJECT') {
+                $reason = 'INVALID_PROJECT: Invalid working directory. Start a fresh CLI session from the exact existing absolute project root; relative paths and filesystem aliases are not supported.'
+            }
+            elseif ($reason -ceq 'HISTORY_SCOPE_REQUIRED') {
+                $reason = 'CLI_HISTORY_SCOPE_REQUIRED: Use source=local. Supported SQL: SELECT id, summary, updated_at FROM sessions WHERE cwd=''<exact project root>'' ORDER BY updated_at DESC LIMIT 20; or SELECT t.session_id, t.user_message, t.assistant_response FROM turns AS t JOIN sessions AS s ON t.session_id=s.id WHERE s.cwd=''<exact project root>'' ORDER BY t.timestamp DESC LIMIT 50. Substitute the current project root and escape SQL quotes. No unscoped queries.'
+            }
+            $decision = ConvertTo-Json -Compress -InputObject @{
+                permissionDecision = 'deny'
+                permissionDecisionReason = $reason
+            }
         }
     }
 }

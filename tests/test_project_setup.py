@@ -188,6 +188,7 @@ class ProjectSetupTests(ProjectWorkspace, unittest.TestCase):
                 status, result = self.invoke(setup.initialize, project)
                 self.assertEqual(1, status)
                 self.assertEqual(["PROJECT_INVALID"], result["codes"])
+                self.assertIn("exact existing absolute project root", " ".join(result["guidance"]))
 
     def test_write_failure_rolls_back_only_generated_content(self):
         with mock.patch.object(Path, "open", side_effect=OSError("SYNTHETIC_PRIVATE_SENTINEL")):
@@ -200,12 +201,37 @@ class ProjectSetupTests(ProjectWorkspace, unittest.TestCase):
         plugin = self.make_plugin("raise SystemExit(1)\n")
         status, result = self.invoke(setup.preflight, self.project, plugin)
         self.assertEqual(1, status)
-        self.assertIn("POLICY_MISSING_OR_INVALID", result["codes"])
+        self.assertIn("POLICY_MISSING", result["codes"])
+        self.assertIn("exact initialized project root", " ".join(result["guidance"]))
         target = self.initialize()
         (target / "policy.json").write_text("SYNTHETIC_PRIVATE_SENTINEL", encoding="utf-8")
         status, result = self.invoke(setup.preflight, self.project, plugin)
         self.assertEqual(1, status)
         self.assertIn("POLICY_INVALID_OR_DRIFT", result["codes"])
+
+    def test_preflight_does_not_inherit_parent_policy_or_replace_configuration(self):
+        target = self.initialize()
+        original = (target / "policy.json").read_bytes()
+        child = self.project / "nested"
+        child.mkdir()
+        plugin = self.make_plugin()
+        with mock.patch.object(setup.subprocess, "run") as run:
+            status, result = self.invoke(setup.preflight, child, plugin)
+        self.assertEqual(1, status)
+        self.assertIn("POLICY_MISSING", result["codes"])
+        self.assertIn("Parent policies are not inherited", " ".join(result["guidance"]))
+        run.assert_not_called()
+        self.assertFalse((child / setup.POLICY_DIRECTORY).exists())
+        self.assertEqual(original, (target / "policy.json").read_bytes())
+
+    def test_preflight_identifies_non_directory_configuration(self):
+        target = self.project / setup.POLICY_DIRECTORY
+        target.write_text("SYNTHETIC_PRIVATE_SENTINEL", encoding="utf-8")
+        status, result = self.invoke(setup.preflight, self.project)
+        self.assertEqual(1, status)
+        self.assertEqual(["PROJECT_CONFIG_INVALID"], result["codes"])
+        self.assertIn("ordinary directory", " ".join(result["guidance"]))
+        self.assertEqual("SYNTHETIC_PRIVATE_SENTINEL", target.read_text(encoding="utf-8"))
 
     def test_preflight_checks_engine_in_isolated_process_and_discards_output(self):
         self.initialize()
@@ -348,6 +374,59 @@ class WindowsHookTests(ProjectWorkspace, unittest.TestCase):
         (plugin / "hooks" / "Invoke-PrivacyGuard.ps1").unlink()
         self.assertEqual("deny", self.invoke_wrapper(plugin, "{}")["permissionDecision"])
 
+    def test_allowlisted_denial_codes_are_preserved_without_engine_fields(self):
+        plugin = self.make_plugin(
+            "import json, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            "print(json.dumps({'permissionDecision': 'deny', "
+            "'permissionDecisionReason': payload['toolArgs']['reason'], "
+            "'details': 'SYNTHETIC_PRIVATE_SENTINEL'}))\n"
+        )
+        for reason in (
+            "TOOL_DENIED", "INVALID_ARGUMENTS", "SEARCH_SCOPE_LIMIT", "SHELL_DENIED",
+            "CONTROL_PATH", "UNCLASSIFIED_FILE", "STALE_DIGEST", "INVALID_FIELDS",
+        ):
+            payload = {"toolArgs": {"reason": reason, "input": "SYNTHETIC_PRIVATE_SENTINEL"}}
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    {"permissionDecision": "deny", "permissionDecisionReason": reason},
+                    self.invoke_wrapper(plugin, json.dumps(payload)),
+                )
+        for reason in (
+            "SYNTHETIC_PRIVATE_SENTINEL", "TOOL_DENIED: SYNTHETIC_PRIVATE_SENTINEL",
+            "tool_denied", "NEW_SAFE_CODE", ["TOOL_DENIED"], {"code": "TOOL_DENIED"}, None,
+        ):
+            with self.subTest(reason=reason):
+                result = self.invoke_wrapper(plugin, json.dumps({"toolArgs": {"reason": reason}}))
+                self.assertEqual(
+                    {"permissionDecision": "deny", "permissionDecisionReason": "CLI_POLICY_DENIED"},
+                    result,
+                )
+
+    def test_real_hook_reports_missing_policy_and_invalid_working_directory(self):
+        plugin = self.make_plugin()
+        payload = {
+            "cwd": str(self.project), "toolName": "ask_user",
+            "toolArgs": {"message": "Review?", "requestedSchema": {"properties": {}}},
+        }
+        missing = self.invoke_wrapper(plugin, json.dumps(payload))
+        self.assertTrue(missing["permissionDecisionReason"].startswith("POLICY_MISSING:"))
+        self.assertIn("current working directory", missing["permissionDecisionReason"])
+        self.assertNotIn(str(self.project), json.dumps(missing))
+        self.initialize()
+        child = self.project / "nested"
+        child.mkdir()
+        payload["cwd"] = str(child)
+        self.assertEqual(missing, self.invoke_wrapper(plugin, json.dumps(payload)))
+        self.assertFalse((child / setup.POLICY_DIRECTORY).exists())
+        for cwd in (".", str(self.project / "missing")):
+            payload["cwd"] = cwd
+            result = self.invoke_wrapper(plugin, json.dumps(payload))
+            self.assertTrue(result["permissionDecisionReason"].startswith("INVALID_PROJECT:"))
+            self.assertIn("working directory", result["permissionDecisionReason"])
+        payload["cwd"] = str(self.project)
+        self.assertEqual({}, self.invoke_wrapper(plugin, json.dumps(payload)))
+
     def test_missing_python_and_internal_timeout_deny(self):
         plugin = self.make_plugin("import time; time.sleep(20)\n")
         wrapper = plugin / "hooks" / "Invoke-PrivacyGuard.ps1"
@@ -377,6 +456,50 @@ class WindowsHookTests(ProjectWorkspace, unittest.TestCase):
         self.assertEqual({}, self.invoke_wrapper(plugin, json.dumps(payload)))
         payload["toolName"] = "unknown"
         self.assertEqual("deny", self.invoke_wrapper(plugin, json.dumps(payload))["permissionDecision"])
+
+    def test_real_hook_handles_current_forms_and_freeform_patches(self):
+        self.initialize()
+        plugin = self.make_plugin()
+        source = self.project / "synthetic.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n*** Update File: synthetic.py\n"
+            "@@\n-value = 1\n+value = 2\n*** End Patch\n"
+        )
+        for name, arguments in (
+            ("ask_user", {"message": "Review?", "requestedSchema": {
+                "properties": {"confirm": {"type": "boolean", "default": True}},
+            }}),
+            ("apply_patch", patch),
+            ("functions.apply_patch", json.dumps(patch)),
+            ("view", {"path": str(source)}),
+            ("functions.rg", {"pattern": "value", "paths": "synthetic.py"}),
+            ("glob", {"pattern": "*.py"}),
+            ("edit", {"path": "synthetic.py", "old_str": "1", "new_str": "2"}),
+            ("create", {"path": "new.py", "file_text": "value = 2\n"}),
+        ):
+            payload = {
+                "cwd": str(self.project), "toolName": name, "toolArgs": arguments,
+                "sessionId": "synthetic-session", "timestamp": 1793289600000,
+            }
+            self.assertEqual({}, self.invoke_wrapper(plugin, json.dumps(payload)))
+        protected = patch.replace("synthetic.py", ".copilot-privacy\\policy.json")
+        payload = {"cwd": str(self.project), "toolName": "apply_patch", "toolArgs": protected}
+        self.assertEqual(
+            "CONTROL_PATH", self.invoke_wrapper(plugin, json.dumps(payload))["permissionDecisionReason"],
+        )
+        external = self.scratch / "external.py"
+        external.write_text("SYNTHETIC_PRIVATE_SENTINEL", encoding="utf-8")
+        for name, arguments in (
+            ("view", {"path": str(external)}),
+            ("edit", {"path": str(external), "old_str": "old", "new_str": "new"}),
+            ("apply_patch", patch.replace("synthetic.py", str(external))),
+        ):
+            payload = {"cwd": str(self.project), "toolName": name, "toolArgs": arguments}
+            result = self.invoke_wrapper(plugin, json.dumps(payload))
+            self.assertEqual("UNCLASSIFIED_FILE", result["permissionDecisionReason"])
+            self.assertNotIn(str(external), json.dumps(result))
+        self.assertEqual("value = 1\n", source.read_text(encoding="utf-8"))
 
     def test_real_hook_allows_repo_search_and_project_history_but_not_other_projects(self):
         self.initialize()
